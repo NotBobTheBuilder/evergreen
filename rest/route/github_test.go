@@ -148,6 +148,69 @@ func (s *GithubWebhookRouteSuite) TestAddIntentAndFailsWithDuplicate() {
 	s.Equal(1, count)
 }
 
+func (s *GithubWebhookRouteSuite) insertPRTestingProjectRef(ctx context.Context) {
+	doc := &model.ProjectRef{
+		Owner:            "evergreen-ci",
+		Repo:             "evergreen",
+		Branch:           "main",
+		Enabled:          true,
+		BatchTime:        10,
+		Id:               "ident0",
+		PRTestingEnabled: utility.TruePtr(),
+	}
+	s.NoError(doc.Insert(ctx))
+}
+
+// prEditedEvent parses the pull_request fixture and turns it into an "edited" event carrying the given changes payload.
+func (s *GithubWebhookRouteSuite) prEditedEvent(changes *github.EditChange) *github.PullRequestEvent {
+	event, err := github.ParseWebHook("pull_request", s.prBody)
+	s.NoError(err)
+	prEvent, ok := event.(*github.PullRequestEvent)
+	s.Require().True(ok)
+	prEvent.Action = utility.ToStringPtr(githubActionEdited)
+	prEvent.Changes = changes
+	return prEvent
+}
+
+// A base branch change arrives as an "edited" action with changes.base populated, and should queue a PR patch intent.
+func (s *GithubWebhookRouteSuite) TestBaseBranchChangeQueuesPatchIntent() {
+	ctx := s.T().Context()
+	s.NoError(db.ClearCollections(model.ProjectRefCollection, patch.IntentCollection))
+	s.insertPRTestingProjectRef(ctx)
+
+	s.h.event = s.prEditedEvent(&github.EditChange{
+		Base: &github.EditBase{Ref: &github.EditRef{From: utility.ToStringPtr("old-base")}},
+	})
+	s.h.msgID = "base-change-1"
+
+	resp := s.h.Run(ctx)
+	s.Equal(http.StatusOK, resp.Status())
+
+	intent, err := patch.FindIntent(ctx, "base-change-1", patch.GithubIntentType)
+	s.NoError(err)
+	s.Require().NotNil(intent)
+	s.Equal("base-change-1", intent.ID())
+}
+
+// A title or body edit (no changes.base) must not queue a PR patch intent.
+func (s *GithubWebhookRouteSuite) TestNonBaseEditDoesNotQueuePatchIntent() {
+	ctx := s.T().Context()
+	s.NoError(db.ClearCollections(model.ProjectRefCollection, patch.IntentCollection))
+	s.insertPRTestingProjectRef(ctx)
+
+	s.h.event = s.prEditedEvent(&github.EditChange{
+		Title: &github.EditTitle{From: utility.ToStringPtr("old title")},
+	})
+	s.h.msgID = "title-edit-1"
+
+	resp := s.h.Run(ctx)
+	s.Equal(http.StatusOK, resp.Status())
+
+	count, err := db.CountQ(ctx, patch.IntentCollection, db.Query(bson.M{}))
+	s.NoError(err)
+	s.Zero(count)
+}
+
 func (s *GithubWebhookRouteSuite) TestParseAndValidateFailsWithoutSignature() {
 	ctx := context.Background()
 	secret := []byte(s.conf.GithubWebhookSecret)
@@ -596,6 +659,52 @@ func TestShouldSkipWebhookPersonalStaging(t *testing.T) {
 			}
 			result := handler.shouldSkipWebhook(ctx, "owner", "repo", tc.fromApp)
 			assert.Equal(t, tc.expectSkip, result)
+		})
+	}
+}
+
+func TestIsPullRequestBaseChange(t *testing.T) {
+	for name, tc := range map[string]struct {
+		action   string
+		changes  *github.EditChange
+		expected bool
+	}{
+		"EditedWithBaseChangeIsTrue": {
+			action:   githubActionEdited,
+			changes:  &github.EditChange{Base: &github.EditBase{Ref: &github.EditRef{From: utility.ToStringPtr("main")}}},
+			expected: true,
+		},
+		"EditedWithTitleChangeIsFalse": {
+			action:   githubActionEdited,
+			changes:  &github.EditChange{Title: &github.EditTitle{From: utility.ToStringPtr("old")}},
+			expected: false,
+		},
+		"EditedWithBodyChangeIsFalse": {
+			action:   githubActionEdited,
+			changes:  &github.EditChange{Body: &github.EditBody{From: utility.ToStringPtr("old")}},
+			expected: false,
+		},
+		"EditedWithNilChangesIsFalse": {
+			action:   githubActionEdited,
+			changes:  nil,
+			expected: false,
+		},
+		"OpenedWithBaseChangeIsFalse": {
+			action:   githubActionOpened,
+			changes:  &github.EditChange{Base: &github.EditBase{}},
+			expected: false,
+		},
+		"SynchronizeIsFalse": {
+			action:   githubActionSynchronize,
+			expected: false,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			event := &github.PullRequestEvent{
+				Action:  utility.ToStringPtr(tc.action),
+				Changes: tc.changes,
+			}
+			assert.Equal(t, tc.expected, isPullRequestBaseChange(event))
 		})
 	}
 }

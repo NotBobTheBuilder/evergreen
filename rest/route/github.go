@@ -35,7 +35,7 @@ const (
 	githubActionOpened          = "opened"
 	githubActionSynchronize     = "synchronize"
 	githubActionReopened        = "reopened"
-	githubActionAutoBaseChange  = "automatic_base_change_succeeded"
+	githubActionEdited          = "edited"
 	githubActionChecksRequested = "checks_requested"
 	githubActionRerequested     = "rerequested"
 	githubActionDestroyed       = "destroyed"
@@ -204,8 +204,11 @@ func (gh *githubHookApi) Run(ctx context.Context) gimlet.Responder {
 		}
 
 		action := utility.FromStringPtr(event.Action)
+		// GitHub sends the "edited" action for title, body, or base branch edits. We only want to (re)create a PR
+		// patch when the base branch changed (e.g. an automatic base change), which is indicated by the changes.base
+		// field in the payload. Title and body edits are ignored.
 		if action == githubActionOpened || action == githubActionSynchronize ||
-			action == githubActionReopened || action == githubActionAutoBaseChange {
+			action == githubActionReopened || isPullRequestBaseChange(event) {
 			grip.Info(ctx, message.Fields{
 				"source":    "GitHub hook",
 				"msg_id":    gh.msgID,
@@ -1529,6 +1532,13 @@ func (gh *githubHookApi) createVersionForTag(ctx context.Context, pRef model.Pro
 	}
 	projectInfo.Ref = &pRef
 	return gh.sc.CreateVersionFromConfig(ctx, &projectInfo, metadata)
+}
+
+// isPullRequestBaseChange reports whether an "edited" pull request event represents a base branch change (as opposed to
+// a title or body edit). GitHub sends the "edited" action for all three, distinguishing them via the changes field; only
+// a base change populates changes.base. The GetChanges/GetBase accessors are nil-safe.
+func isPullRequestBaseChange(event *github.PullRequestEvent) bool {
+	return utility.FromStringPtr(event.Action) == githubActionEdited && event.GetChanges().GetBase() != nil
 }
 
 func getOtherPatchesWithHash(ctx context.Context, githash string, prNum int) ([]patch.Patch, error) {
